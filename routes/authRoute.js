@@ -15,19 +15,17 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// OTP limiter
+// Rate limiter for OTP requests
 const otpLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5,
   message: 'Too many OTP requests. Please try again later.'
 });
 
-// In-memory OTP store (for demo)
+// In-memory OTP store (email: { otp, expiresAt })
 const otpStore = {};
 
-// ======================
-// Register Route
-// ======================
+// =============== Register ==================
 router.post('/register', async (req, res) => {
   const { username, email, password } = req.body;
 
@@ -64,9 +62,7 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// ======================
-// Login Route (with Admin Login Support)
-// ======================
+// =============== Login ==================
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -74,7 +70,7 @@ router.post('/login', async (req, res) => {
     return res.status(400).json({ message: 'Email and password are required' });
   }
 
-  // 🔐 Admin login check
+  // Admin login
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
     return res.status(200).json({
       message: 'Admin login successful',
@@ -105,9 +101,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// ======================
-// Request OTP
-// ======================
+// =============== Request OTP ==================
 router.post('/request-otp', otpLimiter, async (req, res) => {
   const { email } = req.body;
 
@@ -122,14 +116,16 @@ router.post('/request-otp', otpLimiter, async (req, res) => {
     }
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore[email] = otp;
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes from now
+
+    otpStore[email] = { otp, expiresAt };
 
     await transporter.sendMail({
       from: process.env.EMAIL_USER,
       to: email,
       subject: 'Your OTP for Password Reset',
       text: `Your OTP is: ${otp}`,
-      html: `<p>Hello,</p><p>Your OTP is: <b>${otp}</b></p><p>This will expire soon.</p>`
+      html: `<p>Hello,</p><p>Your OTP is: <b>${otp}</b></p><p>This OTP will expire in 5 minutes.</p>`
     });
 
     console.log(`OTP sent to ${email}: ${otp}`);
@@ -140,23 +136,32 @@ router.post('/request-otp', otpLimiter, async (req, res) => {
   }
 });
 
-// ======================
-// Verify OTP
-// ======================
+// =============== Verify OTP ==================
 router.post('/verify-otp', (req, res) => {
   const { email, otp } = req.body;
-  const storedOtp = otpStore[email];
 
-  if (!storedOtp || storedOtp !== otp) {
-    return res.status(400).json({ message: 'Invalid or expired OTP' });
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and OTP are required' });
+  }
+
+  const record = otpStore[email];
+  if (!record) {
+    return res.status(400).json({ message: 'OTP not found or expired' });
+  }
+
+  if (Date.now() > record.expiresAt) {
+    delete otpStore[email];
+    return res.status(400).json({ message: 'OTP has expired' });
+  }
+
+  if (record.otp !== String(otp)) {
+    return res.status(400).json({ message: 'Invalid OTP' });
   }
 
   res.status(200).json({ message: 'OTP verified' });
 });
 
-// ======================
-// Reset Password
-// ======================
+// =============== Reset Password ==================
 router.post('/reset-password', async (req, res) => {
   const { email, otp, newPassword } = req.body;
 
@@ -165,9 +170,14 @@ router.post('/reset-password', async (req, res) => {
   }
 
   try {
-    const storedOtp = otpStore[email];
-    if (!storedOtp || storedOtp !== otp) {
+    const record = otpStore[email];
+    if (!record || record.otp !== String(otp)) {
       return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    if (Date.now() > record.expiresAt) {
+      delete otpStore[email];
+      return res.status(400).json({ message: 'OTP has expired' });
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
@@ -176,7 +186,7 @@ router.post('/reset-password', async (req, res) => {
       email
     ]);
 
-    delete otpStore[email]; // remove used OTP
+    delete otpStore[email]; // Invalidate OTP after use
     res.status(200).json({ message: 'Password reset successful' });
   } catch (err) {
     console.error('Reset password error:', err);
